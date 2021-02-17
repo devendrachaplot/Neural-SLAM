@@ -245,4 +245,10 @@ def get_args():
     else:
         args.num_mini_batch = int(args.num_mini_batch)
 
+    # In case the user sets num_mini_batch to zero or
+    #    num_mini_batch gets set to 0 because num_processes=1
+    # then set num_mini_batch to at least 1
+    if args.num_mini_batch == 0:
+        args.num_mini_batch = 1
+
     return args
