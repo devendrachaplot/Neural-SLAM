@@ -87,10 +87,10 @@ python main.py
 
 ### Downloading pre-trained models
 ```
-mkdir pretrained_models
-wget -O pretrained_models/model_best.global http://www.cs.cmu.edu/~dchaplot/projects/active_neural_slam/model_best.global
-wget -O pretrained_models/model_best.local http://www.cs.cmu.edu/~dchaplot/projects/active_neural_slam/model_best.local
-wget -O pretrained_models/model_best.slam http://www.cs.cmu.edu/~dchaplot/projects/active_neural_slam/model_best.slam
+mkdir pretrained_models;
+wget --no-check-certificate 'https://drive.google.com/uc?export=download&id=1UK2hT0GWzoTaVR5lAI6i8o27tqEmYeyY' -O pretrained_models/model_best.global;
+wget --no-check-certificate 'https://drive.google.com/uc?export=download&id=1A1s_HNnbpvdYBUAiw2y1JmmELRLfAJb8' -O pretrained_models/model_best.local;
+wget --no-check-certificate 'https://drive.google.com/uc?export=download&id=1o5OG7DIUKZyvi5stozSqRpAEae1F2BmX' -O pretrained_models/model_best.slam;
 ```
 
 ### For evaluation:
