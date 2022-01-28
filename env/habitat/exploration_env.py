@@ -1,9 +1,12 @@
 import math
 import os
 import pickle
+from pickletools import float8
 import sys
+from cv2 import threshold
 
 import gym
+import habitat_sim
 import matplotlib
 import numpy as np
 import quaternion
@@ -21,6 +24,11 @@ import matplotlib.pyplot as plt
 
 import habitat
 from habitat import logger
+from habitat.sims.habitat_simulator.actions import (
+    HabitatSimActions,
+    HabitatSimV1ActionSpaceConfiguration,
+)
+
 
 from env.utils.map_builder import MapBuilder
 from env.utils.fmm_planner import FMMPlanner
@@ -32,6 +40,8 @@ from env.habitat.utils.supervision import HabitatMaps
 
 from model import get_grid
 
+from env.habitat.utils.semantic_prediction import SemanticPredMaskRCNN
+import math
 
 def _preprocess_depth(depth):
     depth = depth[:, :, 0]*1
@@ -63,6 +73,25 @@ class Exploration_Env(habitat.RLEnv):
 
         self.rank = rank
 
+        self.sem_pred = SemanticPredMaskRCNN(args)
+
+        #-----objects related initialzation-----#
+        self.sim_count = 0
+        self.sim_object_to_objid_mapping = {}
+        self.object_positions = []
+        self.object_ids = []
+        self.objects = []
+        self.object_scene_nodes = []
+        self.path_step = 0
+        self.path = []
+        self.direction = 1
+        self.object_cur_loc = None
+        
+
+        #self._initialize_object()
+
+
+
         self.sensor_noise_fwd = \
                 pickle.load(open("noise_models/sensor_noise_fwd.pkl", 'rb'))
         self.sensor_noise_right = \
@@ -70,9 +99,13 @@ class Exploration_Env(habitat.RLEnv):
         self.sensor_noise_left = \
                 pickle.load(open("noise_models/sensor_noise_left.pkl", 'rb'))
 
-        habitat.SimulatorActions.extend_action_space("NOISY_FORWARD")
-        habitat.SimulatorActions.extend_action_space("NOISY_RIGHT")
-        habitat.SimulatorActions.extend_action_space("NOISY_LEFT")
+        #habitat.SimulatorActions.extend_action_space("NOISY_FORWARD")
+        #habitat.SimulatorActions.extend_action_space("NOISY_RIGHT")
+        #habitat.SimulatorActions.extend_action_space("NOISY_LEFT")
+        HabitatSimActions.extend_action_space("NOISY_FORWARD")
+        HabitatSimActions.extend_action_space("NOISY_RIGHT")
+        HabitatSimActions.extend_action_space("NOISY_LEFT")
+
 
         config_env.defrost()
         config_env.SIMULATOR.ACTION_SPACE_CONFIG = \
@@ -99,6 +132,8 @@ class Exploration_Env(habitat.RLEnv):
         self.scene_name = None
         self.maps_dict = {}
 
+        self._initialize_object()
+
     def randomize_env(self):
         self._env._episode_iterator._shuffle_iterator()
 
@@ -124,6 +159,38 @@ class Exploration_Env(habitat.RLEnv):
                                        self.agent_state.rotation])
 
 
+
+    def _get_sem_pred(self, rgb, use_seg=True):
+        if use_seg:
+            semantic_pred, self.rgb_vis = self.sem_pred.get_prediction(rgb)
+            semantic_pred = semantic_pred.astype(np.float32)
+        else:
+            semantic_pred = np.zeros((rgb.shape[0], rgb.shape[1], 16))
+            self.rgb_vis = rgb[:, :, ::-1]
+        return semantic_pred
+
+    def _preprocess_obs(self, obs, use_seg=True):
+        args = self.args
+        obs = obs.transpose(1, 2, 0)
+        rgb = obs[:, :, :3]
+        depth = obs[:, :, 3:4]
+
+        sem_seg_pred = self._get_sem_pred(
+            rgb.astype(np.uint8), use_seg=use_seg)
+        depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            rgb = np.asarray(self.res(rgb.astype(np.uint8)))
+            depth = depth[ds // 2::ds, ds // 2::ds]
+            sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+
+        depth = np.expand_dims(depth, axis=2)
+        state = np.concatenate((rgb, depth, sem_seg_pred),
+                               axis=2).transpose(2, 0, 1)
+
+        return state
+
     def reset(self):
         args = self.args
         self.episode_no += 1
@@ -135,6 +202,9 @@ class Exploration_Env(habitat.RLEnv):
             if np.mod(self.episode_no, args.randomize_env_every) == 0:
                 self.randomize_env()
 
+
+        #self._initialize_object()
+
         # Get Ground Truth Map
         self.explorable_map = None
         while self.explorable_map is None:
@@ -144,22 +214,51 @@ class Exploration_Env(habitat.RLEnv):
         self.prev_explored_area = 0.
 
         # Preprocess observations
+        #! here obs is an Observation object, need to first convert to numpy then transpose
         rgb = obs['rgb'].astype(np.uint8)
         self.obs = rgb # For visualization
         if self.args.frame_width != self.args.env_frame_width:
             rgb = np.asarray(self.res(rgb))
-        state = rgb.transpose(2, 0, 1)
+        #state = rgb.transpose(2, 0, 1)
         depth = _preprocess_depth(obs['depth'])
 
-        # Initialize map and pose
+
+        #!TODO get the correct semantic segmantation
+        #sem_seg_pred.shape(128,128,16)
+        sem_seg_pred = self._get_sem_pred(
+            rgb.astype(np.uint8), use_seg=True)
+
+
+        # Preprocess semantic observations
+        # First downscaling 
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            depth_sem = depth[ds // 2::ds, ds // 2::ds]
+        depth_sem = np.expand_dims(depth_sem, axis=2)
+
+
+        #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+        state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
+
+
+        # Initialize map and pose 
         self.map_size_cm = args.map_size_cm
         self.mapper.reset_map(self.map_size_cm)
         self.curr_loc = [self.map_size_cm/100.0/2.0,
-                         self.map_size_cm/100.0/2.0, 0.]
+                         self.map_size_cm/100.0/2.0, 0.]            # [12, 12, 0]
         self.curr_loc_gt = self.curr_loc
         self.last_loc_gt = self.curr_loc_gt
         self.last_loc = self.curr_loc
         self.last_sim_location = self.get_sim_location()
+
+
+        #! Initializa object map
+
+        # try to get object position
+        obj_sim_pos = self.path[0].points[0]
+        dxo_gt, dyo_gt, doo_gt = pu.get_rel_pose_change(self.last_sim_location, self.get_object_location(obj_sim_pos))
+        self.object_cur_loc = pu.get_new_pose(self.curr_loc_gt,
+                               (dxo_gt, dyo_gt, doo_gt))
 
         # Convert pose to cm and degrees for mapper
         mapper_gt_pose = (self.curr_loc_gt[0]*100.0,
@@ -171,7 +270,8 @@ class Exploration_Env(habitat.RLEnv):
             self.mapper.update_map(depth, mapper_gt_pose)
 
         # Initialize variables
-        self.scene_name = self.habitat_env.sim.config.SCENE
+        #self.scene_name = self.habitat_env.sim.config.SCENE
+        self.scene_name = self.habitat_env.sim.config.sim_cfg.scene_id
         self.visited = np.zeros(self.map.shape)
         self.visited_vis = np.zeros(self.map.shape)
         self.visited_gt = np.zeros(self.map.shape)
@@ -190,29 +290,45 @@ class Exploration_Env(habitat.RLEnv):
         self.save_position()
 
         return state, self.info
+        #return obs, self.info
 
     def step(self, action):
 
         args = self.args
         self.timestep += 1
 
+        # moving object within each step
+        for i in range(len(self.objects)):
+            if self.direction and self.path_step  < len(self.path[i].points):
+                self.objects[i].translation = np.array(self.path[i].points[self.path_step])
+                self.path_step += 3
+            elif self.path_step ==0 or self.path_step == len(self.path[i].points):
+                self.direction = -1 * self.direction
+            elif not self.direction and self.path_step > 0:
+                self.objects[i].translation = np.array(self.path[i].points[self.path_step])
+                self.path_step -= 3
+
         # Action remapping
         if action == 2: # Forward
             action = 1
-            noisy_action = habitat.SimulatorActions.NOISY_FORWARD
+            #noisy_action = habitat.SimulatorActions.NOISY_FORWARD
+            noisy_action = HabitatSimActions.NOISY_FORWARD
         elif action == 1: # Right
             action = 3
-            noisy_action = habitat.SimulatorActions.NOISY_RIGHT
+            #noisy_action = habitat.SimulatorActions.NOISY_RIGHT
+            noisy_action = HabitatSimActions.NOISY_RIGHT
         elif action == 0: # Left
             action = 2
-            noisy_action = habitat.SimulatorActions.NOISY_LEFT
+            #noisy_action = habitat.SimulatorActions.NOISY_LEFT
+            noisy_action =  HabitatSimActions.NOISY_LEFT
 
         self.last_loc = np.copy(self.curr_loc)
         self.last_loc_gt = np.copy(self.curr_loc_gt)
         self._previous_action = action
 
         if args.noisy_actions:
-            obs, rew, done, info = super().step(noisy_action)
+            #obs, rew, done, info = super().step(noisy_action)
+            obs, rew, done, info = super().step(action)
         else:
             obs, rew, done, info = super().step(action)
 
@@ -222,9 +338,30 @@ class Exploration_Env(habitat.RLEnv):
         if self.args.frame_width != self.args.env_frame_width:
             rgb = np.asarray(self.res(rgb))
 
-        state = rgb.transpose(2, 0, 1)
 
+        #TODO concatenate depth layer and semantic seg
         depth = _preprocess_depth(obs['depth'])
+
+        #sem_seg_pred.shape(128,128,16)
+        sem_seg_pred = self._get_sem_pred(
+            rgb.astype(np.uint8), use_seg=True)
+
+
+        # Preprocess semantic observations
+        # First downscaling 
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            depth_sem = depth[ds // 2::ds, ds // 2::ds]
+        depth_sem = np.expand_dims(depth_sem, axis=2)
+
+
+        #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+        state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
+
+
+        #state = rgb.transpose(2, 0, 1)
+
+        #depth = _preprocess_depth(obs['depth'])
 
         # Get base sensor and ground-truth pose
         dx_gt, dy_gt, do_gt = self.get_gt_pose_change()
@@ -381,6 +518,14 @@ class Exploration_Env(habitat.RLEnv):
         return x, y, o
 
 
+    def get_object_location(self, points):
+        x = -points[2]
+        y = -points[0]
+        o = np.pi
+        
+        return x, y, o
+
+
     def get_gt_pose_change(self):
         curr_sim_pose = self.get_sim_location()
         dx, dy, do = pu.get_rel_pose_change(curr_sim_pose, self.last_sim_location)
@@ -421,6 +566,7 @@ class Exploration_Env(habitat.RLEnv):
         gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
         planning_window = [gx1, gx2, gy1, gy2]
 
+
         # Get last loc
         last_start_x, last_start_y = self.last_loc[0], self.last_loc[1]
         r, c = last_start_y, last_start_x
@@ -459,6 +605,10 @@ class Exploration_Env(habitat.RLEnv):
                     int(c * 100.0/args.map_resolution)]
         start_gt = pu.threshold_poses(start_gt, self.visited_gt.shape)
         #self.visited_gt[start_gt[0], start_gt[1]] = 1
+
+
+
+
 
         steps = 25
         for i in range(steps):
@@ -522,9 +672,9 @@ class Exploration_Env(habitat.RLEnv):
 
         output = np.zeros((args.goals_size + 1))
 
-        output[0] = int((relative_angle%360.)/5.)
-        output[1] = discretize(relative_dist)
-        output[2] = gt_action
+        output[0] = int((relative_angle%360.)/5.)       # 50
+        output[1] = discretize(relative_dist)                # 4.0
+        output[2] = gt_action                                                     # 0.0
 
         self.relative_angle = relative_angle
 
@@ -537,16 +687,46 @@ class Exploration_Env(habitat.RLEnv):
                 os.makedirs(ep_dir)
 
             if args.vis_type == 1: # Visualize predicted map and pose
+                #! TESTING
+                #! TODO
+                # 1. caculate the rel distance between agent sim location and object sim location
+                #           at EACH timestep before feeded into vu.get_color_map
+                #goal[0], goal[1], _ = self.object_cur_loc
+
+                        # try to get object position
+                #obj_sim_pos = self.path[0].points[0]
+                obj_x, obj_y, obj_z = self.objects[0].translation.b, \
+                    self.objects[0].translation.g ,self.objects[0].translation.r
+                obj_sim_pos = [obj_x, obj_y, obj_z]
+                dxo_gt, dyo_gt, doo_gt = pu.get_rel_pose_change(self.last_sim_location, self.get_object_location(obj_sim_pos))
+                object_cur_loc = pu.get_new_pose(self.curr_loc_gt,
+                                    (dxo_gt, dyo_gt, doo_gt))
+                
+
+                goal_ = [0, 0]
+                #goal_[0], goal_[1], _ = self.object_cur_loc
+                goal_[0], goal_[1], _ = object_cur_loc
+                goal_[0] = int(goal_[0])
+                goal_[1] = int(goal_[1])
                 vis_grid = vu.get_colored_map(np.rint(map_pred),
                                 self.collison_map[gx1:gx2, gy1:gy2],
                                 self.visited_vis[gx1:gx2, gy1:gy2],
                                 self.visited_gt[gx1:gx2, gy1:gy2],
-                                goal,
+                                #goal,
+                                goal_,
                                 self.explored_map[gx1:gx2, gy1:gy2],
                                 self.explorable_map[gx1:gx2, gy1:gy2],
                                 self.map[gx1:gx2, gy1:gy2] *
                                     self.explored_map[gx1:gx2, gy1:gy2])
-                vis_grid = np.flipud(vis_grid)
+                vis_grid = np.flipud(vis_grid)      # (240,240,3)
+                a_0 = start_x - gy1*args.map_resolution/100.0
+                a_1 = start_y - gx1*args.map_resolution/100.0
+                a_2 = start_o
+                x_,y_,z_ = self.objects[0].translation.b, self.objects[0].translation.g,self.objects[0].translation.r
+                bounds = self.habitat_env.sim.pathfinder.get_bounds()
+                px = (x_ - bounds[0][0]) * 24
+                py = (y_ - bounds[0][2]) * 24
+                vis_grid_ = vis_grid[:,:,::-1]      #(240,240,2), first two channels of vis_grid
                 vu.visualize(self.figure, self.ax, self.obs, vis_grid[:,:,::-1],
                             (start_x - gy1*args.map_resolution/100.0,
                              start_y - gx1*args.map_resolution/100.0,
@@ -578,7 +758,8 @@ class Exploration_Env(habitat.RLEnv):
         return output
 
     def _get_gt_map(self, full_map_size):
-        self.scene_name = self.habitat_env.sim.config.SCENE
+        #self.scene_name = self.habitat_env.sim.config.SCENE
+        self.scene_name = self.habitat_env.sim.config.sim_cfg.scene_id
         logger.error('Computing map for %s', self.scene_name)
 
         # Get map in habitat simulator coordinates
@@ -796,3 +977,78 @@ class Exploration_Env(habitat.RLEnv):
             gt_action = 2
 
         return gt_action
+
+
+    # method to initialize moving objects.
+    def _initialize_object(self):
+        object_path = "data/objects"
+        sim = self.habitat_env.sim
+
+        # allow sliding and physics
+        sim.config.sim_cfg.allow_sliding = True
+        habitat_sim.SimulatorConfiguration().enable_physics = True
+
+
+        #first remove all existing objects
+        existing_object_ids = sim.get_existing_object_ids()
+        if len(existing_object_ids)>0:
+            for obj_id in existing_object_ids:
+                sim.remove_object(obj_id)
+
+        # add random path, path distance must be longer than 15.
+        for i in range(5):
+            self.path.append(habitat_sim.ShortestPath())
+            found_valid_path = False
+            # area = sim.pathfinder.navigable_area
+            # cs = round(1.4 * math.sqrt(area), 2)
+            while not found_valid_path:
+                self.path[i].requested_start = sim.pathfinder.get_random_navigable_point()
+                self.path[i].requested_end = sim.pathfinder.get_random_navigable_point()
+                found_path = sim.pathfinder.find_path(self.path[i])
+                if found_path and len(self.path[i].points) > 12:
+                    found_valid_path = True
+                    print(f"found valid path with distance {self.path[i].geodesic_distance}")
+                else:
+                    print('failed to find a long path, try another one..')
+                    print(self.path[i].geodesic_distance)
+            self.object_positions.append(self.path[i].requested_start)
+            self.object_positions.append(self.path[i].requested_end)
+            # self.path[i].requested_start = sim.pathfinder.get_random_navigable_point()
+            # while not found_valid_path:
+            #     self.path[i].requested_end = sim.pathfinder.get_random_navigable_point()
+            #     found_path = sim.pathfinder.find_path(self.path[i])
+            #     if found_path and self.path[i].geodesic_distance > 5:
+            #         found_
+
+
+        # load object templates
+        obj_templates_mgr = sim.get_object_template_manager()
+        rigid_obj_mgr = sim.get_rigid_object_manager()
+        locobot_template_id = obj_templates_mgr.load_object_configs(
+            "data/objects/locobot_merged"
+        )[0]
+
+        # add objects in initial position
+        for i in range(5):
+            locobot_template = obj_templates_mgr.get_template_by_id(locobot_template_id)
+            locobot_template.semantic_id = 1
+            obj_templates_mgr.register_template(locobot_template)
+            self.objects.append(
+                rigid_obj_mgr.add_object_by_template_id(locobot_template_id)
+            )
+            #self.objects[i].motion_type = habitat_sim.physics.MotionType.KINEMATIC
+            self.objects[i].translation = self.object_positions[2*i]
+            self.objects[i].collidable = True
+            #self.objects[i].path = self.path[i]
+            print(f"added objects with objects id {self.objects[i].object_id}")
+            self.object_scene_nodes.append(self.objects[i].root_scene_node)
+            
+            #locobot_template.scale = [1.0 + i * 0.1, 1.0 + i * 0.1, 1.0 + i * 0.1]
+
+            self.object_ids.append(self.objects[i].object_id)
+
+
+    def get_objects_and_paths(self):
+        # sim = self.habitat_env.sim
+        # objs = []
+        return self.objects, self.path
