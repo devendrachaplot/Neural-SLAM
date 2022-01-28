@@ -1,3 +1,9 @@
+# to perform transfer learning on neural-slam module
+# python main.py --train_global 0 --train_local 0 --train_slam 1 \
+# --load-slam pretrain_models/model_best.slam\
+# --load_global pretrained_models/model_best.global \
+# --load_local pretrained_models/model_best.local 
+
 import time
 from collections import deque
 
@@ -15,7 +21,8 @@ from arguments import get_args
 from env import make_vec_envs
 from utils.storage import GlobalRolloutStorage, FIFOMemory
 from utils.optimization import get_optimizer
-from model import RL_Policy, Local_IL_Policy, Neural_SLAM_Module
+from model import RL_Policy, Local_IL_Policy, Neural_SLAM_Module,Semantic_Mapping
+
 
 import algo
 
@@ -57,7 +64,7 @@ def get_local_map_boundaries(agent_loc, local_sizes, full_sizes):
         if gy2 > full_h:
             gy1, gy2 = full_h - local_h, full_h
     else:
-        gx1.gx2, gy1, gy2 = 0, full_w, 0, full_h
+        gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
 
     return [gx1, gx2, gy1, gy2]
 
@@ -125,23 +132,28 @@ def main():
     ### 2. Exploread Area
     ### 3. Current Agent Location
     ### 4. Past Agent Locations
-
+    ### 5. moving object
+    ### 6. movable object
     torch.set_grad_enabled(False)
 
     # Calculating full and local map sizes
     map_size = args.map_size_cm // args.map_resolution
-    full_w, full_h = map_size, map_size
+    full_w, full_h = map_size, map_size     # 480,480
     local_w, local_h = int(full_w / args.global_downscaling), \
-                       int(full_h / args.global_downscaling)
+                       int(full_h / args.global_downscaling)        # 240, 240
 
     # Initializing full and local map
     full_map = torch.zeros(num_scenes, 4, full_w, full_h).float().to(device)
     local_map = torch.zeros(num_scenes, 4, local_w, local_h).float().to(device)
+    full_sem_map = torch.zeros(num_scenes, 20, full_w, full_h).float().to(device)
+    local_sem_map = torch.zeros(num_scenes, 20, local_w, local_h).float().to(device)
+
 
     # Initial full and local pose
     full_pose = torch.zeros(num_scenes, 3).float().to(device)
     local_pose = torch.zeros(num_scenes, 3).float().to(device)
-
+    full_sem_pose = torch.zeros(num_scenes, 3).float().to(device)
+    local_sem_pose = torch.zeros(num_scenes, 3).float().to(device)
     # Origin of local map
     origins = np.zeros((num_scenes, 3))
 
@@ -180,11 +192,44 @@ def main():
             local_pose[e] = full_pose[e] - \
                             torch.from_numpy(origins[e]).to(device).float()
 
+
+    # initialize full semantic map
+    def init_sem_map_and_pose():
+        full_sem_map.fill_(0.)
+        full_pose.fill_(0.)
+        full_pose[:, :2] = args.map_size_cm / 100.0 / 2.0
+
+        locs = full_pose.cpu().numpy()
+        planner_pose_inputs[:, :3] = locs
+        for e in range(num_scenes):
+            r, c = locs[e, 1], locs[e, 0]
+            loc_r, loc_c = [int(r * 100.0 / args.map_resolution),
+                            int(c * 100.0 / args.map_resolution)]
+
+            full_sem_map[e, 2:, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.0
+
+            lmb[e] = get_local_map_boundaries((loc_r, loc_c),
+                                              (local_w, local_h),
+                                              (full_w, full_h))
+
+            planner_pose_inputs[e, 3:] = lmb[e]
+            origins[e] = [lmb[e][2] * args.map_resolution / 100.0,
+                          lmb[e][0] * args.map_resolution / 100.0, 0.]
+
+        for e in range(num_scenes):
+            local_sem_map[e] = full_sem_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]]
+            local_pose[e] = full_pose[e] - \
+                            torch.from_numpy(origins[e]).to(device).float()
+
     init_map_and_pose()
+    #init_sem_map_and_pose()
+
 
     # Global policy observation space
+    #! change here 8 -> 12
     g_observation_space = gym.spaces.Box(0, 1,
                                          (8,
+                                          #12,
                                           local_w,
                                           local_h), dtype='uint8')
 
@@ -206,6 +251,24 @@ def main():
     nslam_module = Neural_SLAM_Module(args).to(device)
     slam_optimizer = get_optimizer(nslam_module.parameters(),
                                    args.slam_optimizer)
+
+    # a = nslam_module.proj1
+    # b = nslam_module.proj2
+    # c = nslam_module.pose_proj1
+    # state_dict = nslam_module.state_dict()
+    # print(state_dict)
+    #---------------begin transfer learning-------------------#
+    # we will only train the fc layers(projection layers)
+    # 1. freeze grad in conv, deconv and pose_conv
+    # for param in nslam_module.parameters():
+    #     param.requires_grad = False
+
+
+
+    #a.weight.requires_grad = True   # only train nslam_module.proj1
+
+
+    #torch.set_grad_enabled(False)
 
     # Global policy
     g_policy = RL_Policy(g_observation_space.shape, g_action_space,
@@ -232,7 +295,7 @@ def main():
                                       g_action_space, g_policy.rec_state_size,
                                       1).to(device)
 
-    slam_memory = FIFOMemory(args.slam_memory_size)
+    slam_memory = FIFOMemory(args.slam_memory_size)     #default:500000
 
     # Loading model
     if args.load_slam != "0":
@@ -262,6 +325,11 @@ def main():
     if not args.train_local:
         l_policy.eval()
 
+
+    # Semantic Mapping
+    sem_map_module = Semantic_Mapping(args).to(device)
+    sem_map_module.eval()
+
     # Predict map from frame 1:
     poses = torch.from_numpy(np.asarray(
         [infos[env_idx]['sensor_pose'] for env_idx
@@ -272,10 +340,73 @@ def main():
         nslam_module(obs, obs, poses, local_map[:, 0, :, :],
                      local_map[:, 1, :, :], local_pose)
 
+    # get moving object traj and convert it to local pose:
+    #o/bjects, paths = envs.get_objects_and_paths()
+    
+    #poses_0 = paths[0].points(0)
+
+    # _,_,_,_,_,local_poses_0 =  \
+    #     nslam_module(obs, obs, poses_0, local_map[:, 0, :, :],
+    #             local_map[:,1,:,:],)
+
+    # full_sem_map = torch.zeros(num_scenes, 20, full_w, full_h).float().to(device)
+    # local_sem_map = torch.zeros(num_scenes, 20, local_w, local_h).float().to(device)
+    # full_sem_pose = torch.zeros(num_scenes, 3).float().to(device)
+    # local_sem_pose = torch.zeros(num_scenes, 3).float().to(device)
+    full_sem_map[:,:4,:,:] = full_map
+    local_sem_map[:,:4,:,:] = local_map
+    full_sem_pose = torch.clone(full_pose)
+    local_sem_pose = torch.clone(local_pose)
+    sem_poses = torch.clone(poses)
+    
+    # predict semantic map from frame 1:
+    #! here we should change obs -> obs[rgb]
+    # _, local_sem_map, _, _ = \
+    #     sem_map_module(obs, sem_poses, local_sem_map, local_pose)
+
+    _, local_sem_map, _, _ = \
+        sem_map_module(obs, sem_poses, local_sem_map, local_pose)
+    # add a channel for movable objects from semantic map, 5 is chair, 7 is potted plants and 17 is bottle
+    # return shape is [1,240,240]
+    moving_object_map = torch.logical_or(local_sem_map[:,5,:,:],local_sem_map[:,7,:,:])
+
+    # mask to local map(inputs for ns module)
+    # we aim to remove the moable objects, so mask to the first channel(obstacle) as 0    
+    local_map[:, 0, :, :][moving_object_map > 0] = 0
+
+    # for the explored layer we average the two maps
+    local_map[:, 1, :, :] = (local_map[:, 1, :, :] + local_sem_map[:, 1, :, :]) / 2
+
+
     # Compute Global policy input
     locs = local_pose.cpu().numpy()
+    #! here global input should be size of [6+6,G,G]
     global_input = torch.zeros(num_scenes, 8, local_w, local_h)
+    #global_input = torch.zeros(num_scenes, 12, local_w, local_h)
     global_orientation = torch.zeros(num_scenes, 1).long()
+
+    map_dir = "data/results/neural_slam/{}/".format(args.exp_name)
+    # if not os.path.exists(map_dir):
+    #     os.mkdir(map_dir)
+    # loc_map = local_map.cpu().numpy()
+    # loc_sem_map = local_sem_map.cpu().numpy()
+    # loc_sem_pose = local_sem_pose.cpu().numpy()
+    # np.save(
+    #     os.path.join(map_dir,'frame_1/local_map.npy'),
+    #     loc_map
+    # )
+    # np.save(
+    #     os.path.join(map_dir,'frame_1/local_pose.npy'),
+    #     locs
+    # )
+    # np.save(
+    #     os.path.join(map_dir,'frame_1/local_sem_map.npy'),
+    #     loc_sem_map
+    # )
+    # np.save(
+    #     os.path.join(map_dir,'frame_1/loc_sem_pose.npy'),
+    #     loc_sem_pose
+    # )
 
     for e in range(num_scenes):
         r, c = locs[e, 1], locs[e, 0]
@@ -286,7 +417,13 @@ def main():
         global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)
 
     global_input[:, 0:4, :, :] = local_map.detach()
+    a = local_map[:,:3,:,:]     #shape(1,3,240,240)
+    #global_input[:, 0:4, :, :] = local_map[:,0:4,:,:].detach()
     global_input[:, 4:, :, :] = nn.MaxPool2d(args.global_downscaling)(full_map)
+    # global inputs is concatnated with 2 parts, downsampled [4xGxG] and maxpooled [4xGxG]
+    # as i added two semantic layers here should be [6xGxG] + [6xGxG] = [12xGxG]
+    #? full_map size is (1,6,480,480)
+    #global_input[:, 6:, :, :] = nn.MaxPool2d(args.global_downscaling)(full_map)
 
     g_rollouts.obs[0].copy_(global_input)
     g_rollouts.extras[0].copy_(global_orientation)
@@ -323,7 +460,7 @@ def main():
     total_num_steps = -1
     g_reward = 0
 
-    torch.set_grad_enabled(False)
+    #torch.set_grad_enabled(False)
 
     for ep_num in range(num_episodes):
         for step in range(args.max_episode_length):
@@ -386,6 +523,7 @@ def main():
                     env_gt_fp_projs = torch.from_numpy(np.asarray(
                         infos[env_idx]['fp_proj']
                     )).unsqueeze(0).float().to("cpu")
+                    # env_groundtrouth_firstperson_expoloredarea
                     env_gt_fp_explored = torch.from_numpy(np.asarray(
                         infos[env_idx]['fp_explored']
                     )).unsqueeze(0).float().to("cpu")
@@ -405,6 +543,34 @@ def main():
                 nslam_module(last_obs, obs, poses, local_map[:, 0, :, :],
                              local_map[:, 1, :, :], local_pose, build_maps=True)
 
+
+            # _, _, local_map[:, 0, :, :], local_map[:, 1, :, :], _, local_pose = \
+            #     nslam_module(obs, obs, poses, local_map[:, 0, :, :],
+            #                 local_map[:, 1, :, :], local_pose)
+
+            #TODO add semantic module and mask the local map before feeded into global policy
+
+            
+            #!might cause noise by using local_pose, might need a seperate variable
+            #full_sem_map[:,:4,:,:] = full_map
+            local_sem_map[:,:4,:,:] = local_map
+            #full_sem_pose = torch.clone(full_pose)
+            local_sem_pose = torch.clone(local_pose)
+            sem_poses = torch.clone(poses)
+
+            _, local_sem_map, _, _ = sem_map_module(obs, sem_poses, local_sem_map, local_sem_pose)
+
+            #moving_object_map = (local_sem_map[:,5,:,:] + local_sem_map[:,7,:,:] + local_sem_map[:,17,:,:]) / 3
+            moving_object_map = torch.logical_or(local_sem_map[:,5,:,:],local_sem_map[:,7,:,:])
+            # mask to local map(inputs for ns module)
+            # we aim to remove the moable objects, so mask to the first channel(obstacle) as 0    
+            local_map[:, 0, :, :][moving_object_map > 0] = 0
+
+            # for the explored layer we average the two maps
+            #! should delete this line, local_sem_map shouldnt contribute to mapping
+            local_map[:, 1, :, :] = (local_map[:, 1, :, :] + local_sem_map[:, 1, :, :]) / 2
+
+            
             locs = local_pose.cpu().numpy()
             planner_pose_inputs[:, :3] = locs + origins
             local_map[:, 2, :, :].fill_(0.)  # Resetting current location channel
@@ -414,6 +580,19 @@ def main():
                                 int(c * 100.0 / args.map_resolution)]
 
                 local_map[e, 2:, loc_r - 2:loc_r + 3, loc_c - 2:loc_c + 3] = 1.
+
+
+            #save loc map for inspection
+            loc_map = local_map.cpu().numpy()
+            # np.save(
+            #     os.path.join(map_dir,"{}_local_map.npy".format(step)),
+            #     loc_map
+            # )
+            # np.save(
+            #     os.path.join(map_dir,"{}_local_pose.npy".format(step)),
+            #     locs
+            # )
+
             # ------------------------------------------------------------------
 
             # ------------------------------------------------------------------
@@ -447,10 +626,12 @@ def main():
                 locs = local_pose.cpu().numpy()
                 for e in range(num_scenes):
                     global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)
-                global_input[:, 0:4, :, :] = local_map
+                #global_input[:, 0:4, :, :] = local_map
+                global_input[:, 0:4, :, :] = local_map[:,0:4,:,:]
                 global_input[:, 4:, :, :] = \
                     nn.MaxPool2d(args.global_downscaling)(full_map)
-
+                # global_input[:, 6:, :, :] = \
+                #     nn.MaxPool2d(args.global_downscaling)(full_map)
                 if False:
                     for i in range(4):
                         ax[i].clear()
@@ -536,10 +717,26 @@ def main():
 
             ### TRAINING
             torch.set_grad_enabled(True)
+
+            #! transfer learning, only train the fc layers, begin with nslam.proj1 layers
+            # for param in nslam_module.parameters():
+            #     param.requires_grad = False
+            # nslam_module.proj1.weight.requires_grad = True
+            # # params = filter((lambda p: p.requires_grad, nslam_module.parameters()))
+            # # slam_optimizer = get_optimizer(nslam_module.parameters(),
+            # #                     args.slam_optimizer)
+            # slam_optimizer = get_optimizer(nslam_module.proj1.parameters(),
+            #                     args.slam_optimizer)
+
+
             # ------------------------------------------------------------------
             # Train Neural SLAM Module
             if args.train_slam and len(slam_memory) > args.slam_batch_size:
-                for _ in range(args.slam_iterations):
+                for _ in range(args.slam_iterations):   # default 10
+                    #     defination in slam_memory
+                    #                    slam_memory.push(
+                    #    (last_obs[env_idx].cpu(), env_obs, env_poses),
+                    #    (#env_gt_fp_projs, env_gt_fp_explored, env_gt_pose_err))
                     inputs, outputs = slam_memory.sample(args.slam_batch_size)
                     b_obs_last, b_obs, b_poses = inputs
                     gt_fp_projs, gt_fp_explored, gt_pose_err = outputs
@@ -552,23 +749,27 @@ def main():
                     gt_fp_explored = gt_fp_explored.to(device)
                     gt_pose_err = gt_pose_err.to(device)
 
+
+                    #         return proj_pred, fp_exp_pred, map_pred, exp_pred, pose_pred, current_poses
                     b_proj_pred, b_fp_exp_pred, _, _, b_pose_err_pred, _ = \
                         nslam_module(b_obs_last, b_obs, b_poses,
                                      None, None, None,
                                      build_maps=False)
                     loss = 0
+                    # Mapper
                     if args.proj_loss_coeff > 0:
                         proj_loss = F.binary_cross_entropy(b_proj_pred,
                                                            gt_fp_projs)
                         costs.append(proj_loss.item())
                         loss += args.proj_loss_coeff * proj_loss
-
+                    # Mapper
                     if args.exp_loss_coeff > 0:
                         exp_loss = F.binary_cross_entropy(b_fp_exp_pred,
                                                           gt_fp_explored)
                         exp_costs.append(exp_loss.item())
                         loss += args.exp_loss_coeff * exp_loss
 
+                    # Pose Estimator
                     if args.pose_loss_coeff > 0:
                         pose_loss = torch.nn.MSELoss()(b_pose_err_pred,
                                                        gt_pose_err)
@@ -577,6 +778,7 @@ def main():
                         loss += args.pose_loss_coeff * pose_loss
 
                     if args.train_slam:
+
                         slam_optimizer.zero_grad()
                         loss.backward()
                         slam_optimizer.step()
