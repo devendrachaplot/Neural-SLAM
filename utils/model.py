@@ -25,18 +25,31 @@ def get_grid(pose, grid_size, device):
     cos_t = t.cos()
     sin_t = t.sin()
 
+    # n,3
     theta11 = torch.stack([cos_t, -sin_t,
                            torch.zeros(cos_t.shape).float().to(device)], 1)
+
+    # n,3
     theta12 = torch.stack([sin_t, cos_t,
                            torch.zeros(cos_t.shape).float().to(device)], 1)
+    # n,2,3
+    # cos -sin 0
+    # sin cos 0
     theta1 = torch.stack([theta11, theta12], 1)
+
 
     theta21 = torch.stack([torch.ones(x.shape).to(device),
                            -torch.zeros(x.shape).to(device), x], 1)
     theta22 = torch.stack([torch.zeros(x.shape).to(device),
                            torch.ones(x.shape).to(device), y], 1)
+    # 1 0 x
+    # - 1 y
     theta2 = torch.stack([theta21, theta22], 1)
 
+    # n,grid_size,grid_size,2
+    # 这里grid其实是，新的图像像素对应旧图像像素的坐标
+    # 即，[2,4]向时针方向旋转是到达右边，但实际生成的grid是左边，
+    # 因为相当于固定旋转后的图像不动，这样看来就是旧图像向顺时针方向旋转了
     rot_grid = F.affine_grid(theta1, torch.Size(grid_size))
     trans_grid = F.affine_grid(theta2, torch.Size(grid_size))
 

@@ -198,6 +198,9 @@ class GlobalRolloutStorage(RolloutStorage):
                                                  action_log_probs, value_preds, rewards, masks)
 
 
+# 是将tuple添加上名字
+# 如：Datapoint('a','b')则为：Datapoint(input='a',output='b')
+# 可用 Datapoint(input='a',output='b').input输出a
 Datapoint = namedtuple('Datapoint',
                        ('input', 'target'))
 

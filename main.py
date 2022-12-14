@@ -57,13 +57,18 @@ def get_local_map_boundaries(agent_loc, local_sizes, full_sizes):
         if gy2 > full_h:
             gy1, gy2 = full_h - local_h, full_h
     else:
-        gx1.gx2, gy1, gy2 = 0, full_w, 0, full_h
+        gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
 
     return [gx1, gx2, gy1, gy2]
 
 
 def main():
     # Setup Logging
+    # args是全局变量，在上面直接就启动了
+    #'-d', '--dump_location', type=str, default="./tmp/"
+    # '--exp_name', type=str, default="exp1",
+
+    # 配置log记录
     log_dir = "{}/models/{}/".format(args.dump_location, args.exp_name)
     dump_dir = "{}/dump/{}/".format(args.dump_location, args.exp_name)
 
@@ -82,26 +87,34 @@ def main():
 
     # Logging and loss variables
     num_scenes = args.num_processes
-    num_episodes = int(args.num_episodes)
+    num_episodes = int(args.num_episodes) # 1000000
     device = args.device = torch.device("cuda:0" if args.cuda else "cpu")
     policy_loss = 0
 
+    # 构建NSM的loss
     best_cost = 100000
     costs = deque(maxlen=1000)
     exp_costs = deque(maxlen=1000)
     pose_costs = deque(maxlen=1000)
 
+    # 全局和局部的mask
     g_masks = torch.ones(num_scenes).float().to(device)
     l_masks = torch.zeros(num_scenes).float().to(device)
 
+    # 构建局部的loss
     best_local_loss = np.inf
+
+    # 构建全局的reward
     best_g_reward = -np.inf
 
     if args.eval:
+        #               1000//25
         traj_lengths = args.max_episode_length // args.num_local_steps
+        # n个场景，100000个episodes(回合)，每次局部走25步，最长episodes回合有1000步
         explored_area_log = np.zeros((num_scenes, num_episodes, traj_lengths))
         explored_ratio_log = np.zeros((num_scenes, num_episodes, traj_lengths))
 
+    # todo 因为最长的回合是1000吗？
     g_episode_rewards = deque(maxlen=1000)
 
     l_action_losses = deque(maxlen=1000)
@@ -115,6 +128,7 @@ def main():
     g_process_rewards = np.zeros((num_scenes))
 
     # Starting environments
+    # 和Habitat有关
     torch.set_num_threads(1)
     envs = make_vec_envs(args)
     obs, infos = envs.reset()
@@ -129,70 +143,105 @@ def main():
     torch.set_grad_enabled(False)
 
     # Calculating full and local map sizes
+    # map_size_cm:2400cm, map_resolution:5cm
+    # size = 2400 / 5 = 480
     map_size = args.map_size_cm // args.map_resolution
     full_w, full_h = map_size, map_size
+
+    # 下采样率为global_downscaling=2
+    # 2400/5/2 = 240
     local_w, local_h = int(full_w / args.global_downscaling), \
                        int(full_h / args.global_downscaling)
 
     # Initializing full and local map
+    # 全局地图n×4×480×480
     full_map = torch.zeros(num_scenes, 4, full_w, full_h).float().to(device)
+    # 全局地图n×4×240×240
     local_map = torch.zeros(num_scenes, 4, local_w, local_h).float().to(device)
 
     # Initial full and local pose
+    # n,[x,y,theta]
     full_pose = torch.zeros(num_scenes, 3).float().to(device)
     local_pose = torch.zeros(num_scenes, 3).float().to(device)
 
     # Origin of local map
+    # 局部地图的左上角，下面初始化
     origins = np.zeros((num_scenes, 3))
 
     # Local Map Boundaries
+    # 局部地图的边界：左上角和右下角
+    # n，4
     lmb = np.zeros((num_scenes, 4)).astype(int)
 
     ### Planner pose inputs has 7 dimensions
     ### 1-3 store continuous global agent location
     ### 4-7 store local map boundaries
+    # 1-3是一个连续全局agent的位置，4-7是一个局部地图边界
+    # planner的输入是long-term goal、location、map
     planner_pose_inputs = np.zeros((num_scenes, 7))
 
+    #
     def init_map_and_pose():
         full_map.fill_(0.)
         full_pose.fill_(0.)
+        # 初始化为地图中心，方向为0
         full_pose[:, :2] = args.map_size_cm / 100.0 / 2.0
+
 
         locs = full_pose.cpu().numpy()
         planner_pose_inputs[:, :3] = locs
         for e in range(num_scenes):
+            # r=row=y,c=col=x,
+            # 这里其实地图的长宽是一样的
             r, c = locs[e, 1], locs[e, 0]
+
+            # 求当前坐标的离散化坐标
             loc_r, loc_c = [int(r * 100.0 / args.map_resolution),
                             int(c * 100.0 / args.map_resolution)]
 
+            # num_scenes, 4, full_w, full_h
+            # 全局地图的前两个维度是occ和semantic，后两个维度分别是当前的位姿和走过的点
+            # 这里应该是考虑额一个单位的膨胀，3*3区域设置为1，就是15*15cm
             full_map[e, 2:, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.0
 
+            # 求取局部地图的左上角和右下角
             lmb[e] = get_local_map_boundaries((loc_r, loc_c),
                                               (local_w, local_h),
                                               (full_w, full_h))
 
+
             planner_pose_inputs[e, 3:] = lmb[e]
+            # 左上角
             origins[e] = [lmb[e][2] * args.map_resolution / 100.0,
                           lmb[e][0] * args.map_resolution / 100.0, 0.]
 
         for e in range(num_scenes):
+            #     full_map = torch.zeros(num_scenes, 4, full_w, full_h).float().to(device)
+            #     local_map = torch.zeros(num_scenes, 4, local_w, local_h).float().to(device)
             local_map[e] = full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]]
+
+            # 当前位置减去左上角就是局部坐标
             local_pose[e] = full_pose[e] - \
                             torch.from_numpy(origins[e]).to(device).float()
 
     init_map_and_pose()
 
     # Global policy observation space
+    # 8，w，h大小的观测空间，uint类型，每一个值为0或1
+    # 4×G×G+4×G×G
+    # 评估的时候下采样为4
     g_observation_space = gym.spaces.Box(0, 1,
                                          (8,
                                           local_w,
                                           local_h), dtype='uint8')
 
     # Global policy action space
+    # 动作空间，应该就是long-term goal
     g_action_space = gym.spaces.Box(low=0.0, high=1.0,
                                     shape=(2,), dtype=np.float32)
 
     # Local policy observation space
+    # 当前局部观测空间，3,×128*128
     l_observation_space = gym.spaces.Box(0, 255,
                                          (3,
                                           args.frame_width,
@@ -205,7 +254,7 @@ def main():
     # slam
     nslam_module = Neural_SLAM_Module(args).to(device)
     slam_optimizer = get_optimizer(nslam_module.parameters(),
-                                   args.slam_optimizer)
+                                   args.slam_optimizer) # adam
 
     # Global policy
     g_policy = RL_Policy(g_observation_space.shape, g_action_space,
@@ -224,7 +273,7 @@ def main():
                                hidden_size=l_hidden_size,
                                deterministic=args.use_deterministic_local).to(device)
     local_optimizer = get_optimizer(l_policy.parameters(),
-                                    args.local_optimizer)
+                                    args.local_optimizer) # adam
 
     # Storage
     g_rollouts = GlobalRolloutStorage(args.num_global_steps,
@@ -234,33 +283,35 @@ def main():
 
     slam_memory = FIFOMemory(args.slam_memory_size)
 
-    # Loading model
-    if args.load_slam != "0":
-        print("Loading slam {}".format(args.load_slam))
-        state_dict = torch.load(args.load_slam,
-                                map_location=lambda storage, loc: storage)
-        nslam_module.load_state_dict(state_dict)
+    def load_model():
 
-    if not args.train_slam:
-        nslam_module.eval()
+        # Loading model
+        if args.load_slam != "0":
+            print("Loading slam {}".format(args.load_slam))
+            state_dict = torch.load(args.load_slam,
+                                    map_location=lambda storage, loc: storage)
+            nslam_module.load_state_dict(state_dict)
 
-    if args.load_global != "0":
-        print("Loading global {}".format(args.load_global))
-        state_dict = torch.load(args.load_global,
-                                map_location=lambda storage, loc: storage)
-        g_policy.load_state_dict(state_dict)
+        if not args.train_slam:
+            nslam_module.eval()
 
-    if not args.train_global:
-        g_policy.eval()
+        if args.load_global != "0":
+            print("Loading global {}".format(args.load_global))
+            state_dict = torch.load(args.load_global,
+                                    map_location=lambda storage, loc: storage)
+            g_policy.load_state_dict(state_dict)
 
-    if args.load_local != "0":
-        print("Loading local {}".format(args.load_local))
-        state_dict = torch.load(args.load_local,
-                                map_location=lambda storage, loc: storage)
-        l_policy.load_state_dict(state_dict)
+        if not args.train_global:
+            g_policy.eval()
 
-    if not args.train_local:
-        l_policy.eval()
+        if args.load_local != "0":
+            print("Loading local {}".format(args.load_local))
+            state_dict = torch.load(args.load_local,
+                                    map_location=lambda storage, loc: storage)
+            l_policy.load_state_dict(state_dict)
+
+        if not args.train_local:
+            l_policy.eval()
 
     # Predict map from frame 1:
     poses = torch.from_numpy(np.asarray(
