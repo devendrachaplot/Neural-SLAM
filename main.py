@@ -64,6 +64,11 @@ def get_local_map_boundaries(agent_loc, local_sizes, full_sizes):
 
 def main():
     # Setup Logging
+    # args是全局变量，在上面直接就启动了
+    #'-d', '--dump_location', type=str, default="./tmp/"
+    # '--exp_name', type=str, default="exp1",
+
+    # 配置log记录
     log_dir = "{}/models/{}/".format(args.dump_location, args.exp_name)
     dump_dir = "{}/dump/{}/".format(args.dump_location, args.exp_name)
 
@@ -82,7 +87,7 @@ def main():
 
     # Logging and loss variables
     num_scenes = args.num_processes
-    num_episodes = int(args.num_episodes)
+    num_episodes = int(args.num_episodes) # 1000000
     device = args.device = torch.device("cuda:0" if args.cuda else "cpu")
     policy_loss = 0
 
@@ -91,6 +96,7 @@ def main():
     exp_costs = deque(maxlen=1000)
     pose_costs = deque(maxlen=1000)
 
+    # 全局和局部的mask
     g_masks = torch.ones(num_scenes).float().to(device)
     l_masks = torch.zeros(num_scenes).float().to(device)
 
@@ -129,8 +135,12 @@ def main():
     torch.set_grad_enabled(False)
 
     # Calculating full and local map sizes
+    # map_size_cm:2400cm, map_resolution:5cm
+    # size = 480
     map_size = args.map_size_cm // args.map_resolution
     full_w, full_h = map_size, map_size
+
+    # 下采样率为global_downscaling=2
     local_w, local_h = int(full_w / args.global_downscaling), \
                        int(full_h / args.global_downscaling)
 

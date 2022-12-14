@@ -9,20 +9,35 @@ def get_args():
     ## General Arguments
     parser.add_argument('--seed', type=int, default=1,
                         help='random seed (default: 1)')
+
+    # 自动设置gpu数目，0是非自动，1是自动
     parser.add_argument('--auto_gpu_config', type=int, default=1)
+
+    # 总的场景数量
     parser.add_argument('--total_num_scenes', type=str, default="auto")
+
+    #　总的进程数量，在设置了auto_gpu_config的时候就不管
     parser.add_argument('-n', '--num_processes', type=int, default=4,
                         help="""how many training processes to use (default:4)
                                 Overridden when auto_gpu_config=1
                                 and training on gpus """)
+
+    # 每个gpu进程数量
     parser.add_argument('--num_processes_per_gpu', type=int, default=11)
+
+    # 第一个gpu的进程数量，因为第一个gpu拿来放pytorch模型，因此为0
     parser.add_argument('--num_processes_on_first_gpu', type=int, default=0)
+
+    # 总的训练样本数目
     parser.add_argument('--num_episodes', type=int, default=1000000,
                         help='number of training episodes (default: 1000000)')
+
     parser.add_argument('--no_cuda', action='store_true', default=False,
                         help='disables CUDA training')
     parser.add_argument('--eval', type=int, default=0,
                         help='1: evaluate models (default: 0)')
+
+    # 是否训练模型，0不训练，1训练
     parser.add_argument('--train_global', type=int, default=1,
                         help="""0: Do not train the Global Policy
                                 1: Train the Global Policy (default: 1)""")
@@ -45,6 +60,8 @@ def get_args():
                         help='experiment name (default: exp1)')
     parser.add_argument('--save_periodic', type=int, default=500000,
                         help='Model save frequency in number of updates')
+
+    # 加载模型
     parser.add_argument('--load_slam', type=str, default="0",
                         help="""model path to load,
                                 0 to not reload (default: 0)""")
@@ -54,6 +71,7 @@ def get_args():
     parser.add_argument('--load_local', type=str, default="0",
                         help="""model path to load,
                                 0 to not reload (default: 0)""")
+
     parser.add_argument('-v', '--visualize', type=int, default=0,
                         help='1:Render the frame (default: 0)')
     parser.add_argument('--vis_type', type=int, default=1,
@@ -168,8 +186,13 @@ def get_args():
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     if args.cuda:
+        # 自动配置gpu
         if args.auto_gpu_config:
+
+            # 多少个gpu
             num_gpus = torch.cuda.device_count()
+
+            # 场景数目，根据训练数据类型来推导总的场景数目
             if args.total_num_scenes != "auto":
                 args.total_num_scenes = int(args.total_num_scenes)
             elif "gibson" in args.task_config and \
@@ -192,27 +215,39 @@ def get_args():
             for i in range(num_gpus):
                 gpu_memory = min(gpu_memory,
                     torch.cuda.get_device_properties(i).total_memory \
-                            /1024/1024/1024)
+                            /1024/1024/1024) # KB,MB,GB
+
+                # 需要10GB启动
                 if i==0:
                     assert torch.cuda.get_device_properties(i).total_memory \
                             /1024/1024/1024 > 10.0, "Insufficient GPU memory"
 
+            # 一个进程分配1.4GB的显存，先预估每个GPU能跑的最大进程数目
             num_processes_per_gpu = int(gpu_memory/1.4)
+
+            # 第一个GPU需要空出10GB给模型，其他用来放训练进程
             num_processes_on_first_gpu = int((gpu_memory - 10.0)/1.4)
 
+            # 只有一个GPU，所有进程都放在第一块GPU，其他都是0
             if num_gpus == 1:
                 args.num_processes_on_first_gpu = num_processes_on_first_gpu
                 args.num_processes_per_gpu = 0
                 args.num_processes = num_processes_on_first_gpu
+
+            # 总的线程数是第一块GPU加上其他所有GPU的线程数
             else:
                 total_threads = num_processes_per_gpu * (num_gpus - 1) \
                                 + num_processes_on_first_gpu
 
+                # 每个进程的场景数
                 num_scenes_per_thread = math.ceil(total_num_scenes/total_threads)
                 num_threads = math.ceil(total_num_scenes/num_scenes_per_thread)
+
+                # 从能够跑的最大进程数，和需要的进程数之间取最小值
                 args.num_processes_per_gpu = min(num_processes_per_gpu,
                                         math.ceil(num_threads//(num_gpus-1)))
 
+                # 如果其他GPU跑不了的进程才放到第一块GPU
                 args.num_processes_on_first_gpu = max(0,
                         num_threads - args.num_processes_per_gpu*(num_gpus - 1))
 
@@ -227,6 +262,7 @@ def get_args():
             print("Number of processes per GPU: {}".format(
                                       args.num_processes_per_gpu))
 
+    # todo eval模式应该自动设置为不训练
     if args.eval == 1:
         if args.train_global:
             print("WARNING: Training Global Policy during evaluation")
@@ -235,6 +271,7 @@ def get_args():
         if args.train_slam:
             print("WARNING: Training Neural SLAM module during evaluation")
 
+    # 短距离目标不能够大于1m
     assert args.short_goal_dist >= 1, "args.short_goal_dist >= 1"
 
     if args.use_deterministic_local:
