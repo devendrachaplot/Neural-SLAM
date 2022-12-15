@@ -348,8 +348,7 @@ class Neural_SLAM_Module(nn.Module):
             exp_pred = None
             current_poses = None
 
-        return proj_pred, fp_exp_pred, map_pred, exp_pred,\
-               pose_pred, current_poses
+        return proj_pred, fp_exp_pred, map_pred, exp_pred, pose_pred, current_poses
 
 
 # Local Policy model code

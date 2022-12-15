@@ -11,12 +11,17 @@ def get_optimizer(parameters, s):
         - "sgd,lr=0.01"
         - "adagrad,lr=0.1,lr_decay=0.05"
     """
+    # todo 这里只是为了读入参数，可以用其他方式实现
     if "," in s:
         method = s[:s.find(',')]
         optim_params = {}
+        # 除去method之外的参数，按照','进行分割[lr=0.1,lr_decay=0.05]
         for x in s[s.find(',') + 1:].split(','):
+            # lr=0.1
             split = x.split('=')
+            # [lr,0.1]
             assert len(split) == 2
+            # 正则表达式
             assert re.match("^[+-]?(\d+(\.\d*)?|\.\d+)$", split[1]) is not None
             optim_params[split[0]] = float(split[1])
     else:
@@ -29,7 +34,10 @@ def get_optimizer(parameters, s):
         optim_fn = optim.Adagrad
     elif method == 'adam':
         optim_fn = optim.Adam
+        # 如果有beta1就get，否则为0.5
         optim_params['betas'] = (optim_params.get('beta1', 0.5), optim_params.get('beta2', 0.999))
+        # 真正的使用是：out = dict.pop('key'[,default])，没有的key就返回default
+        # 去除原来的beta1
         optim_params.pop('beta1', None)
         optim_params.pop('beta2', None)
     elif method == 'adamax':
@@ -47,6 +55,7 @@ def get_optimizer(parameters, s):
         raise Exception('Unknown optimization method: "%s"' % method)
 
     # check that we give good parameters to the optimizer
+    # 判断给定的参数是否在optimize里面，如果不在则抛出异常
     expected_args = inspect.getargspec(optim_fn.__init__)[0]
     assert expected_args[:2] == ['self', 'params']
     if not all(k in expected_args[2:] for k in optim_params.keys()):

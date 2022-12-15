@@ -127,9 +127,11 @@ def main():
 
     g_process_rewards = np.zeros((num_scenes))
 
+    # 限制CPU跑的线程数，不设置的化默认是利用CPU核心数的线程进行训练
+    torch.set_num_threads(1)
+
     # Starting environments
     # 和Habitat有关
-    torch.set_num_threads(1)
     envs = make_vec_envs(args)
     obs, infos = envs.reset()
 
@@ -218,6 +220,7 @@ def main():
         for e in range(num_scenes):
             #     full_map = torch.zeros(num_scenes, 4, full_w, full_h).float().to(device)
             #     local_map = torch.zeros(num_scenes, 4, local_w, local_h).float().to(device)
+            # 注意：local_map和full_map共享内存
             local_map[e] = full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]]
 
             # 当前位置减去左上角就是局部坐标
@@ -319,6 +322,9 @@ def main():
          in range(num_scenes)])
     ).float().to(device)
 
+    # 1，2是mapper的输出，3，4是真实的map，5的dx，6是匹配更新后的pose
+    # output: proj_pred, fp_exp_pred, map_pred, exp_pred, pose_pred, current_poses
+    # input: obs_last, obs, poses, maps, explored, current_poses,
     _, _, local_map[:, 0, :, :], local_map[:, 1, :, :], _, local_pose = \
         nslam_module(obs, obs, poses, local_map[:, 0, :, :],
                      local_map[:, 1, :, :], local_pose)
@@ -337,12 +343,14 @@ def main():
         global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)
 
     global_input[:, 0:4, :, :] = local_map.detach()
+    # 由于full_map和local_map共享内存，因此full_map也已经完成了更新
     global_input[:, 4:, :, :] = nn.MaxPool2d(args.global_downscaling)(full_map)
 
     g_rollouts.obs[0].copy_(global_input)
     g_rollouts.extras[0].copy_(global_orientation)
 
     # Run Global Policy (global_goals = Long-Term Goal)
+    # g_aciton是输出，然后下面经过sigmoid生成action，然后变成long-term goal
     g_value, g_action, g_action_log_prob, g_rec_states = \
         g_policy.act(
             g_rollouts.obs[0],
@@ -357,14 +365,21 @@ def main():
                     for action in cpu_actions]
 
     # Compute planner inputs
+    # 输入long，location，map，输出short
     planner_inputs = [{} for e in range(num_scenes)]
     for e, p_input in enumerate(planner_inputs):
+
+        # long
         p_input['goal'] = global_goals[e]
+        # 占用地图
         p_input['map_pred'] = global_input[e, 0, :, :].detach().cpu().numpy()
+        # 探索概率地图
         p_input['exp_pred'] = global_input[e, 1, :, :].detach().cpu().numpy()
+        # 当前的位置+局部地图边界
         p_input['pose_pred'] = planner_pose_inputs[e]
 
     # Output stores local goals as well as the the ground-truth action
+    # output包括局部的goal和gt的action
     output = envs.get_short_term_goal(planner_inputs)
 
     last_obs = obs.detach()
@@ -380,6 +395,7 @@ def main():
         for step in range(args.max_episode_length):
             total_num_steps += 1
 
+            # 局部25步，全局40步
             g_step = (step // args.num_local_steps) % args.num_global_steps
             eval_g_step = step // args.num_local_steps + 1
             l_step = step % args.num_local_steps
@@ -402,6 +418,7 @@ def main():
             )
 
             if args.train_local:
+                # env返回gt的action和short-term goal
                 action_target = output[:, -1].long().to(device)
                 policy_loss += nn.CrossEntropyLoss()(action_prob, action_target)
                 torch.set_grad_enabled(False)
