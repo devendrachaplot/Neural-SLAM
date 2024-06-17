@@ -4,4 +4,4 @@ seaborn==0.9.0
 imageio==2.6.0
 scikit-fmm==2019.1.30
 scikit-image==0.15.0
-scikit-learn==0.22.2.post1
+scikit-learn==1.5.0
